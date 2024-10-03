@@ -27,10 +27,10 @@ const uint16_t PixelCount = 1;
 const uint8_t PixelPin = 2;
 NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> strip(PixelCount, PixelPin);
 
-static const int MAX_VALUE = 900;
-static const int VUnits = MAX_VALUE;
-
-static double DECAY = 0.8;
+static const int MAX_STANDBY_BRIGHTNESS = 20;
+static const int MILLIS_UNTIL_STANDBY = 3000;
+static const uint8_t MAX_VOLTAGE = 1023;
+static const float COLOR_DECAY = 0.75;
 
 #define BUFFER_LEN 2
 
@@ -38,19 +38,25 @@ static double DECAY = 0.8;
 unsigned int localPort = 7832;
 char packetBuffer[BUFFER_LEN];
 
-int lastLeft = 0;
-int lastRight = 0;
-int holdDelay = 81;
-int dropDelay = 11;
+float lastLeft = 0;
+float lastRight = 0;
+int lastRed = 0;
+int lastGreen = 0;
+int lastBlue = 0;
+
+int holdDelay = 1;
+int dropDelay = 1;
 int red = 255;
-int green = 150;
-int blue = 50;
+int green = 0;
+int blue = 80;
+float decay = 0.33;
 
 WiFiUDP port;
 ESP8266WebServer server(80);
 
 void connectWifi() {
   WiFi.begin(STASSID, STAPSK);
+  WiFi.hostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -64,10 +70,64 @@ void connectWifi() {
   Serial.println(WiFi.macAddress());
 }
 
+const char HTML[] PROGMEM = R"=====(
+<html>
+<head>
+    <style>
+        input {
+            width: 16em;
+            height: 16em;
+        }
+
+        body {
+            font-size: 8em;
+        }
+
+        .slider {
+            width: 66%;
+            -webkit-appearance: none;
+            appearance: none;
+            height: 16em;
+        }
+
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16em;
+            height: 16em;
+        }
+
+        .slider::-moz-range-thumb {
+            width: 16em;
+            height: 16em;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <form id='form' method='post' action='/postform/'>
+        ${holdDelay}
+        <input type='submit' name='decreaseDelay' value='-'>
+        <input type='submit' name='increaseDelay' value='+'>
+        <br>
+        ${dropDelay}
+        <input type='submit' name='decreaseDropDelay' value='-'>
+        <input type='submit' name='increaseDropDelay' value='+'>
+        <br><label id='decay'></label><br>decay<input class='slider' type='range' min='0' max='1000' value='${decay}' name='decay' oninput="document.getElementById('decay').innerHTML=this.value" onchange="document.getElementById('form').submit()">
+        <br><label id='fRed'>R</label><input class='slider' type='range' min='0' max='255' value='${red}' name='red' oninput="document.getElementById('fRed').innerHTML=this.value" onchange="document.getElementById('form').submit()">
+        <br><label id='fGreen'>G</label><input class='slider' type='range' min='0' max='255' value='${green}' name='green' oninput="document.getElementById('fGreen').innerHTML=this.value" onchange="document.getElementById('form').submit()">
+        <br><label id='fBlue'>B</label><input class='slider' type='range' min='0' max='255' value='${blue}' name='blue' oninput="document.getElementById('fBlue').innerHTML=this.value" onchange="document.getElementById('form').submit()">
+    </form>
+</body>
+</html>
+)=====";
+
 void handleRoot() {
-  String ret = String("<html><head><style>input{width: 16em;height: 16em;} body{font-size: 8em;}.slider{width:66%; -webkit-appearance: none; appearance: none; height: 16em;}.slider::-webkit-slider-thumb{-webkit-appearance: none; appearance: none; width: 16em; height: 16em;}.slider::-moz-range-thumb{width: 16em; height: 16em; cursor: pointer;}</style></head><body> <form id='form' method='post' action='/postform/'>${holdDelay}<input type='submit' name='decreaseDelay' value='-'><input type='submit' name='increaseDelay' value='+'><br>${dropDelay}<input type='submit' name='decreaseDropDelay' value='-'><input type='submit' name='increaseDropDelay' value='+'><br>R<input class='slider' type='range' min='0' max='255' value='${red}' name='red' oninput=\"document.getElementById('fRed').innerHTML=this.value\" onchange=\"document.getElementById('form').submit()\"><label id='fRed'></label><br>G<input class='slider' type='range' min='0' max='255' value='${green}' name='green' oninput=\"document.getElementById('fGreen').innerHTML=this.value\" onchange=\"document.getElementById('form').submit()\"><label id='fGreen'></label><br>B<input class='slider' type='range' min='0' max='255' value='${blue}' name='blue' oninput=\"document.getElementById('fBlue').innerHTML=this.value\" onchange=\"document.getElementById('form').submit()\"><label id='fBlue'></label><br></form></body></html>");
+  String ret = String(HTML);
   ret.replace("${holdDelay}", String(holdDelay));
   ret.replace("${dropDelay}", String(dropDelay));
+  ret.replace("${decay}", String(decay * 1000));
   ret.replace("${red}", String(red));
   ret.replace("${green}", String(green));
   ret.replace("${blue}", String(blue));
@@ -97,12 +157,17 @@ void handleForm() {
   if (server.hasArg("blue")) {
     blue = server.arg("blue").toInt();
   }
+  if (server.hasArg("decay")) {
+    decay = server.arg("decay").toFloat() / 1000.0;
+  }
   setColor(red, green, blue);
   Serial.println(server.argName(0));
   Serial.print("Hold Delay: ");
   Serial.print(holdDelay);
   Serial.print(" Drop Delay: ");
   Serial.print(dropDelay);
+  Serial.print(" decay: ");
+  Serial.print(decay);
   Serial.print(" RGB: ");
   Serial.print(red);
   Serial.print(" ");
@@ -117,81 +182,104 @@ void setColor(int redValue, int greenValue, int blueValue) {
   strip.SetPixelColor(0, c);
   strip.SetPixelColor(1, c);
   strip.Show();
-
-  //Serial.print(redValue);
-  //Serial.print(" ");
-  //Serial.print(greenValue);
-  //Serial.print(" ");
-  //Serial.println(blueValue);
 }
 
 void setup() {
     Serial.begin(115200);
     Serial.println("Starting");
-    
     pinMode(led, OUTPUT);
     pinMode(LEFT_PIN,OUTPUT);
     pinMode(RIGHT_PIN,OUTPUT);
     analogWrite(LEFT_PIN, LOW);
     analogWrite(RIGHT_PIN, LOW);
-
     strip.Begin();
     strip.Show();
     setColor(255,255,255);
- 
     digitalWrite(led, LOW);
-
     connectWifi();
-    
     digitalWrite(led, HIGH);
     delay(500);
     digitalWrite(led, LOW);
     port.begin(localPort);
     digitalWrite(led, HIGH);
-
     server.on("/",handleRoot);
     server.on("/postform/", handleForm);
     server.begin();
+    lastLeft = 512;
+    lastRight = 512;
+    lastRed = red;
+    lastGreen = green;
+    lastBlue = blue;
 }
 
+long lastMillis = 0;
+float maxLeft = 255;
+float maxRight = 255;
 
 void loop() {
     int packetSize = port.parsePacket();
     if (packetSize) {
         int len = port.read(packetBuffer, 2);
-        //Serial.println("Received ");
         float left = packetBuffer[0];
         float right = packetBuffer[1];
-        //Serial.print("Left ");
-        //Serial.print(left);
-        //Serial.print(" Right ");
-        //Serial.print(right);
-        left = (left * MAX_VALUE) / 255;
-        right = (right * MAX_VALUE) / 255;
-        //Serial.print(" -> Left ");
-        //Serial.print(left);
-        //Serial.print(" Right ");
-        //Serial.println(right);
-        analogWrite(LEFT_PIN, left);
-        analogWrite(RIGHT_PIN, right);
-        setColor(red,green,blue);
+        maxLeft = max(maxLeft, left);
+        maxRight = max(maxRight, right);
+        left = max(lastLeft, left);
+        right = max(lastRight, right);
+        int vLeft = (int)(left * MAX_VOLTAGE / maxLeft);
+        int vRight = (int)(right * MAX_VOLTAGE / maxRight);
+        Serial.print(" Input Left ");
+        Serial.print(left);
+        Serial.print(" Right ");
+        Serial.print(right);
+        Serial.print(" | maxLeft: ");
+        Serial.print(maxLeft);
+        Serial.print(" maxRight: ");
+        Serial.print(maxRight);
+        Serial.print(" | lastLeft: ");
+        Serial.print(lastLeft);
+        Serial.print(" lastRight: ");
+        Serial.print(lastRight);
+        Serial.print(" | decay: ");
+        Serial.print(decay);
+        Serial.print(" | Voltage Left ");
+        Serial.print(vLeft);
+        Serial.print(" Right ");
+        Serial.println(vRight);
 
+        analogWrite(LEFT_PIN, vLeft);
+        analogWrite(RIGHT_PIN, vRight);
+        setColor(red,green,blue);
         delay(holdDelay);
-      
-        analogWrite(LEFT_PIN, left / 2);
-        analogWrite(RIGHT_PIN, right / 2);
-        delay(dropDelay);
         
-        lastLeft = left;
-        lastRight = right;
+        lastRed = red;
+        lastGreen = green;
+        lastBlue = blue;
+        lastLeft = left * decay;
+        lastRight = right * decay;
+        lastMillis = millis();
     } else {
-        Serial.println("Zero ");
-        lastLeft = lastLeft * DECAY;
-        lastRight = lastRight * DECAY;
-        analogWrite(LEFT_PIN, lastLeft);
-        analogWrite(RIGHT_PIN, lastRight);
-        setColor(0,0,0);
-        delay(holdDelay);
+        if ((millis() - lastMillis) > MILLIS_UNTIL_STANDBY) {
+          // Serial.print("Standby ");
+          // Serial.print(lastRed);
+          // Serial.print(" ");
+          // Serial.print(lastGreen);
+          // Serial.print(" ");
+          // Serial.println(lastBlue);
+          if ((lastLeft > 1) || (lastRight > 1)) {
+            lastLeft = lastLeft * decay;
+            lastRight = lastRight * decay;
+            analogWrite(LEFT_PIN, lastLeft);
+            analogWrite(RIGHT_PIN, lastRight);
+          }
+          if ((lastRed > MAX_STANDBY_BRIGHTNESS) || (lastGreen > MAX_STANDBY_BRIGHTNESS) || (lastBlue > MAX_STANDBY_BRIGHTNESS)) {
+            lastRed = lastRed * COLOR_DECAY;
+            lastGreen = lastGreen * COLOR_DECAY;
+            lastBlue = lastBlue * COLOR_DECAY;
+            setColor(lastRed,lastGreen,lastBlue);
+          }
+          delay(holdDelay);
+        }
     }
     server.handleClient();
 }
